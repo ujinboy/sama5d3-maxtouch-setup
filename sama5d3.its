@@ -1,0 +1,39 @@
+/dts-v1/;
+
+/ {
+	description = "SAMA5D3 Xplained FIT Image";
+	#address-cells = <1>;
+
+	images {
+		kernel_img {
+			description = "Linux kernel";
+			data = /incbin/("zImage");
+			type = "kernel";
+			arch = "arm";
+			os = "linux";
+			compression = "none";
+			load = <0x22000000>;
+			entry = <0x22000000>;
+			hash-1 { algo = "crc32"; };
+		};
+
+		base_fdt {
+			description = "SAMA5D3 Xplained base DTB";
+			data = /incbin/("at91-sama5d3_xplained.dtb");
+			type = "flat_dt";
+			arch = "arm";
+			compression = "none";
+			hash-1 { algo = "crc32"; };
+		};
+	};
+
+	configurations {
+		default = "kernel_dtb";
+
+		kernel_dtb {
+			description = "Linux + SAMA5D3 Xplained DTB";
+			kernel = "kernel_img";
+			fdt = "base_fdt";
+		};
+	};
+};
