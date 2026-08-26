@@ -1,6 +1,6 @@
 #!/bin/bash
-# build.sh — SAMA5D3 maXTouch kernel 4.19 build script
-# Compiler: arm-linux-gnueabihf- (GCC 5.4, VirtualBox or WSL)
+# build_vbox.sh — SAMA5D3 maXTouch kernel 4.19 build script (VirtualBox Ubuntu 16.04)
+# Compiler: arm-linux-gnueabihf- (GCC 5.4, /usr/bin/)
 # Output: ~/at91/build/sama5d3_xplained.itb
 
 cd "$(dirname "$0")"
@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 export ARCH=arm
 export CROSS_COMPILE=arm-linux-gnueabihf-
 
-BUILD_DIR=$(cd "$(dirname "$0")/../.." && pwd)/build
+BUILD_DIR=${HOME}/at91/build
 mkdir -p ${BUILD_DIR}
 
 BUILD_NUM=$(date +%y%m%d.%H%M)
@@ -32,6 +32,6 @@ cp arch/arm/boot/zImage ${BUILD_DIR}/
 cp arch/arm/boot/dts/at91-sama5d3_xplained.dtb ${BUILD_DIR}/
 export PATH=$(pwd)/scripts/dtc:$PATH
 cd ${BUILD_DIR}
-mkimage -f sama5d3.its sama5d3_xplained.itb
+/usr/bin/mkimage -f sama5d3.its sama5d3_xplained.itb
 echo "=== ITB ready: ${BUILD_DIR}/sama5d3_xplained.itb ==="
 echo "=== Kernel version: 4.19.0-v4.19_${BUILD_NUM} ==="
