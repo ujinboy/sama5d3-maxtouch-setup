@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 export ARCH=arm
 export CROSS_COMPILE=arm-linux-gnueabihf-
 
-BUILD_DIR=${HOME}/at91/build
+BUILD_DIR=$(cd "$(dirname "$0")/../.." && pwd)/build
 mkdir -p ${BUILD_DIR}
 
 BUILD_NUM=$(date +%y%m%d.%H%M)
