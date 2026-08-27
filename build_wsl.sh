@@ -14,19 +14,36 @@ mkdir -p ${BUILD_DIR}
 
 BUILD_NUM=$(date +%y%m%d.%H%M)
 
+# Check libisl.so.15 (required by GCC 5.4 cross compiler)
+if [ ! -f /usr/lib/x86_64-linux-gnu/libisl.so.15 ]; then
+    echo "ERROR: libisl.so.15 not found."
+    echo "Copy from VirtualBox:"
+    echo "  pscp mxt@10.161.41.37:/usr/lib/x86_64-linux-gnu/libisl.so.15.1.1 /usr/lib/x86_64-linux-gnu/"
+    echo "  ln -sf libisl.so.15.1.1 /usr/lib/x86_64-linux-gnu/libisl.so.15"
+    exit 1
+fi
+
 # Fix init/Kconfig: $(shell,...) and $(success,...) syntax not supported by
 # Ubuntu 24.04 kconfig. Replace with compatible defaults.
 if grep -q '$(shell,' init/Kconfig 2>/dev/null; then
     echo "=== Patching init/Kconfig for Ubuntu 24.04 kconfig compatibility ==="
     python3 - << 'PYEOF'
-import re
 with open('init/Kconfig', 'r') as f:
-    content = f.read()
-content = re.sub(r'\tdefault \$\(shell,.*?\) if CC_IS_GCC', '\tdefault 0 if CC_IS_GCC', content)
-content = re.sub(r'\tdef_bool \$\(success,.*?\)', '\tdef_bool n', content)
-content = re.sub(r'\tdefault \$\(shell,.*?\)', '\tdefault 0', content)
+    lines = f.readlines()
+out = []
+for line in lines:
+    # $(shell,...) → 0
+    if '$(shell,' in line:
+        if 'if CC_IS_GCC' in line:
+            line = '\tdefault 0 if CC_IS_GCC\n'
+        else:
+            line = '\tdefault 0\n'
+    # $(success,...) → n
+    elif '$(success,' in line:
+        line = '\tdef_bool n\n'
+    out.append(line)
 with open('init/Kconfig', 'w') as f:
-    f.write(content)
+    f.writelines(out)
 print("init/Kconfig patched")
 PYEOF
 fi
