@@ -15,6 +15,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+		bootargs = "console=ttyS0,115200 init=/bin/sh";
 	};
 
 	memory {
@@ -79,7 +80,19 @@
 
 			i2c0: i2c@f0014000 {
 				pinctrl-0 = <&pinctrl_i2c0_pu>;
+				clock-frequency = <400000>;
 				status = "okay";
+
+				atmel_mxt_ts@4a {
+					compatible = "atmel,atmel_mxt_ts";
+					reg = <0x4a>;
+					interrupt-parent = <&pioC>;
+					interrupts = <24 0x2>;	/* PC24 falling edge */
+					pinctrl-names = "default";
+					pinctrl-0 = <&pinctrl_mxt_chg>;
+					reset-gpios = <&pioC 22 GPIO_ACTIVE_LOW>;
+					atmel,fw_name = "maxtouch.fw";
+				};
 			};
 
 			i2c1: i2c@f0018000 {
@@ -170,7 +183,7 @@
 
 			spi1: spi@f8008000 {
 				cs-gpios = <&pioC 25 0>;
-				status = "okay";
+				status = "disabled";
 			};
 
 			adc0: adc@f8018000 {
@@ -223,6 +236,11 @@
 							<AT91_PIOA 18 AT91_PERIPH_B AT91_PINCTRL_PULL_UP>,
 							<AT91_PIOA 19 AT91_PERIPH_B AT91_PINCTRL_PULL_UP>;
 					};
+
+				pinctrl_mxt_chg: mxt_chg {
+					atmel,pins =
+						<AT91_PIOC 24 AT91_PERIPH_GPIO AT91_PINCTRL_PULL_UP_DEGLITCH>;
+				};
 
 					pinctrl_key_gpio: key_gpio_0 {
 						atmel,pins =

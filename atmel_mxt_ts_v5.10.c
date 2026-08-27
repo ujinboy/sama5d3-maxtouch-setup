@@ -16,7 +16,7 @@
  *
  */
 
-#define DRIVER_VERSION_NUMBER "4.19-20250905"
+#define DRIVER_VERSION_NUMBER "4.19-20260605-v2"
 
 #include <linux/version.h>
 #include <linux/acpi.h>
@@ -26,7 +26,6 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
-#include <linux/ktime.h>
 #include <linux/i2c.h>
 #include <linux/input/mt.h>
 #include <linux/interrupt.h>
@@ -58,7 +57,7 @@
 /* Registers */
 #define MXT_OBJECT_START	0x07
 #define MXT_INFO_CRC_SIZE	3
-#define MXT_MAX_BLOCK_RD_WR	256
+#define MXT_MAX_BLOCK_RD_WR	255
 
 /* Objects */
 #define MXT_GEN_ENCRYPTIONSTATUS_T2	2
@@ -1195,38 +1194,52 @@ static int mxt_bootloader_write(struct mxt_data *data,
 
 static int mxt_lookup_bootloader_address(struct mxt_data *data, bool retry)
 {
-	u8 appmode = data->client->addr;
-	u8 bootloader;
-	u8 family_id = data->info ? data->info->family_id : 0;
+	u8 bootloader = 0x4a;
+	u8 bootloader_offset;
+	u8 family_id;
+	u8 appmode;
+	int ret = 0;
+
+	family_id = (data->info != NULL) ? data->info->family_id : (u8)0;
+
+	if (data->client->addr > 0xFFU) {
+		dev_err(&data->client->dev,
+			"I2C address is too large 0x%04x\n", data->client->addr);
+		return -EINVAL;
+	}
+
+	appmode = (u8)data->client->addr;
+
+	// Determine the correct offset based on context
+	if (((appmode == 0x4aU) || (appmode == 0x4bU)) && (retry || (family_id >= 0xa2U))) {
+		bootloader_offset = 0x24U;
+	} else {
+		bootloader_offset = 0x26U;
+	}
 
 	switch (appmode) {
 	case 0x4a:
 	case 0x4b:
-		/* Chips after 1664S use different scheme */
-		if (retry || family_id >= 0xa2) {
-			bootloader = appmode - 0x24;
-			break;
-		}
-		/* Fall through for normal case */
 	case 0x4c:
 	case 0x4d:
 	case 0x5a:
 	case 0x5b:
-		bootloader = appmode - 0x26;
+		bootloader = appmode - bootloader_offset;
 		break;
 
 	default:
 		dev_err(&data->client->dev,
 			"Appmode i2c address 0x%02x not found\n",
 			appmode);
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	}
 
 	data->bootloader_addr = bootloader;
 
 	dev_info(&data->client->dev, "Bootloader address: %x\n", bootloader);
 
-	return 0;
+	return ret;
 }
 
 static int mxt_probe_bootloader(struct mxt_data *data, bool alt_address)
@@ -1288,21 +1301,17 @@ recheck:
 		 * line signals state transitions. We must wait for the
 		 * CHG assertion before reading the status byte.
 		 * Once the status byte has been read, the line is deasserted.
-		 *
-		 * Polling fallback: if completion times out (edge missed),
-		 * poll bootloader status directly with retries.
 		 */
 		ret = mxt_wait_for_completion(data, &data->bl_completion,
 					      MXT_FW_CHG_TIMEOUT);
 		if (ret) {
-			/* Polling fallback: try reading status directly */
-			int poll;
-			for (poll = 0; poll < 50; poll++) {
-				usleep_range(1000, 1500);
-				if (mxt_bootloader_read(data, &val, 1) == 0)
-					goto got_status;
-			}
-			dev_err(dev, "Update wait error %d (polling also failed)\n", ret);
+			/*
+			 * TODO: handle -ERESTARTSYS better by terminating
+			 * fw update process before returning to userspace
+			 * by writing length 0x000 to device (iff we are in
+			 * WAITING_FRAME_DATA state).
+			 */
+			dev_err(dev, "Update wait error %d\n", ret);
 			return ret;
 		}
 	}
@@ -1311,7 +1320,6 @@ recheck:
 	if (ret)
 		return ret;
 
-got_status:
 	if (state == MXT_WAITING_BOOTLOAD_CMD)
 		val = mxt_get_bootloader_version(data, val);
 
@@ -6773,6 +6781,14 @@ ssize_t fw_version_show(struct device *dev,
 			 info->version >> 4, info->version & 0xf, info->build);
 }
 
+/* Return driver version as a string */
+static ssize_t drvr_version_show(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		DRIVER_VERSION_NUMBER);
+} 
+
 static ssize_t tx_seq_number_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -6939,16 +6955,6 @@ static ssize_t diagnostic_msg_show(struct device *dev,
 
 #endif
 
-#define MXT_FW_MAGIC	0x4D3C2B1Au
-#define MXT_FW_HDR_BASE	22u
-#define MXT_FW_HDR_CDM	30u
-
-static inline u32 mxt_read_le32(const u8 *p)
-{
-	return (u32)p[0] | ((u32)p[1] << 8) |
-	       ((u32)p[2] << 16) | ((u32)p[3] << 24);
-}
-
 static int mxt_load_fw(struct device *dev, const char *fn)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
@@ -6958,61 +6964,22 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 	unsigned int retry = 0;
 	unsigned int frame = 0;
 	int ret;
-	ktime_t t_total_start, t_frame_start, t_frame_end;
-	s64 frame_us, total_ms;
-	/* .fw package parsing */
-	const u8 *fw_data;
-	size_t fw_size;
-	u32 magic, hdr_len, cfg_len, fw_len, cdm_len = 0;
 
 	ret = request_firmware(&fw, fn, dev);
 	if (ret) {
 		dev_err(dev, "Unable to open firmware %s\n", fn);
 		goto release_firmware;
 	} else {
-		dev_info(dev, "Opened firmware file: %s (%zu bytes)\n",
-			 fn, fw->size);
+		dev_info(dev, "Opened firmware file: %s\n", fn);
 	}
 
-	/* Check if this is a .fw package with magic header */
-	if (fw->size >= MXT_FW_HDR_BASE) {
-		magic = mxt_read_le32(fw->data);
-	} else {
-		magic = 0;
-	}
+	/* Check for incorrect enc file */
+	ret = mxt_check_firmware_format(dev, fw);
 
-	if (magic == MXT_FW_MAGIC) {
-		hdr_len = mxt_read_le32(fw->data + 0x04);
-		cfg_len = mxt_read_le32(fw->data + 0x08);
-		fw_len  = mxt_read_le32(fw->data + 0x0C);
-		if (hdr_len >= MXT_FW_HDR_CDM)
-			cdm_len = mxt_read_le32(fw->data + 0x16);
-
-		dev_info(dev, "[fw-pkg] hdr=%u cfg=%u fw=%u cdm=%u\n",
-			 hdr_len, cfg_len, fw_len, cdm_len);
-
-		if ((size_t)(hdr_len + cfg_len + fw_len + cdm_len) > fw->size) {
-			dev_err(dev, "[fw-pkg] invalid section lengths\n");
-			ret = -EINVAL;
-			goto release_firmware;
-		}
-
-		/* Use fw section only for bootloader flash */
-		fw_data = fw->data + hdr_len + cfg_len;
-		fw_size = fw_len;
-	} else {
-		/* Legacy: treat entire file as bootloader binary */
-		fw_data = fw->data;
-		fw_size = fw->size;
-	}
-
-	/* Check for incorrect enc file (check first byte of fw section) */
-	if (fw_size > 0 && fw_data[0] == ':') {
-		dev_err(dev, "The firmware file is in enc format\n");
-		ret = -EINVAL;
+	if (ret)
 		goto release_firmware;
-	}
-	dev_info(dev, "File format is okay\n");
+	else
+		dev_info(dev, "File format is okay\n");
 
 	if (!data->in_bootloader) {
 		/* Change to the bootloader mode */
@@ -7054,28 +7021,21 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 		ret = mxt_send_bootloader_cmd(data, true);
 		if (ret)
 			goto disable_irq;
-
-		/* Wait for bootloader to process unlock */
-		msleep(200);
 	}
 
-	t_total_start = ktime_get();
-
-	while (pos < fw_size) {
-		t_frame_start = ktime_get();
-
+	while (pos < fw->size) {
 		ret = mxt_check_bootloader(data, MXT_WAITING_FRAME_DATA, true);
 		if (ret)
 			goto disable_irq;
 
-		frame_size = ((*(fw_data + pos) << 8) |
-			     *(fw_data + pos + 1));
+		frame_size = ((*(fw->data + pos) << 8) |
+			     *(fw->data + pos + 1));
 
 		/* Take account of CRC bytes */
 		frame_size += 2;
 
 		/* Write one frame to device */
-		ret = mxt_bootloader_write(data, &fw_data[pos], frame_size);
+		ret = mxt_bootloader_write(data, &fw->data[pos], frame_size);
 		if (ret)
 			goto disable_irq;
 
@@ -7091,24 +7051,17 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 				goto disable_irq;
 			}
 		} else {
-			t_frame_end = ktime_get();
-			frame_us = ktime_us_delta(t_frame_end, t_frame_start);
-
 			retry = 0;
 			pos += frame_size;
 			frame++;
-
-			dev_info(dev, "[fw-time] frame %u: %lld us (%u bytes)\n",
-				frame, frame_us, frame_size);
 		}
 
-		if (pos >= fw_size) {
-			total_ms = ktime_ms_delta(ktime_get(), t_total_start);
-			dev_info(dev, "[fw-time] TOTAL: %u frames, %zu bytes, %lld ms\n",
-				frame, fw_size, total_ms);
+		if (pos >= fw->size) {
+			dev_info(dev, "Sent %u frames, %zu bytes\n",
+				frame, fw->size);
 		} else if (frame % 50 == 0) {
 			dev_info(dev, "Sent %u frames, %d/%zu bytes\n",
-				frame, pos, fw_size);
+				frame, pos, fw->size);
 		}
 	}
 
@@ -7120,14 +7073,14 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 	 * errors.
 	 */
 
-	/*
-	 * Wait for device to leave bootloader and enter app mode.
-	 * Similar to mxt-lab: sleep 1.5s then verify app mode.
-	 */
-	msleep(1500);
+	msleep(MXT_BOOTLOADER_WAIT);	/* Wait for chip to leave bootloader*/
+
+	ret = mxt_wait_for_completion(data, &data->bl_completion,
+				      MXT_BOOTLOADER_WAIT);
+	if (ret < 0)
+		goto disable_irq;
 
 	data->in_bootloader = false;
-	dev_info(dev, "Firmware flash done, waiting for app mode\n");
 
 disable_irq:
 	disable_irq(data->irq);
@@ -7135,399 +7088,6 @@ release_firmware:
 	release_firmware(fw);
 	return ret;
 }
-/*
- * mxt_write_cfg_binary - Write .fw package cfg section to device
- *
- * Binary cfg format: [type(1B)][instance(1B)][size(1B)][data(size B)] ...
- * Resolves object addresses from IC object table, writes via I2C.
- */
-static int mxt_write_cfg_binary(struct mxt_data *data,
-				const u8 *cfg_buf, size_t cfg_len)
-{
-	struct device *dev = &data->client->dev;
-	struct i2c_client *client = data->client;
-	struct mxt_object *object;
-	size_t off = 0;
-	int written = 0, skipped = 0;
-	int ret;
-	u8 pad_buf[256];
-	u8 type, inst, size;
-	u16 obj_addr, obj_size, write_size;
-
-	memset(pad_buf, 0, sizeof(pad_buf));
-
-	while (off + 3 <= cfg_len) {
-		type = cfg_buf[off];
-		inst = cfg_buf[off + 1];
-		size = cfg_buf[off + 2];
-		off += 3;
-
-		if (off + size > cfg_len) {
-			dev_err(dev, "[cfg-bin] truncated type=%u off=%zu\n",
-				type, off);
-			break;
-		}
-
-		/* Skip volatile objects (same as mxt-lab) */
-		if (type == 2 || type == 5 || type == 6 || type == 37 ||
-		    type == 44 || type == 53 || type == 68 || type == 138) {
-			off += size;
-			skipped++;
-			continue;
-		}
-
-		object = mxt_get_object(data, type);
-		if (!object) {
-			off += size;
-			skipped++;
-			continue;
-		}
-
-		if (inst >= mxt_obj_instances(object)) {
-			off += size;
-			skipped++;
-			continue;
-		}
-
-		obj_addr = object->start_address +
-			   inst * mxt_obj_size(object);
-		obj_size = mxt_obj_size(object);
-		write_size = (size < obj_size) ? size : obj_size;
-
-		if (!(data->crc_enabled)) {
-			ret = __mxt_write_reg(client, obj_addr, write_size,
-					      cfg_buf + off, data);
-		} else {
-			ret = __mxt_write_reg_crc(client, obj_addr, write_size,
-						  cfg_buf + off, data, 0);
-		}
-		if (ret) {
-			dev_err(dev, "[cfg-bin] write T%u failed (%d)\n",
-				type, ret);
-			return ret;
-		}
-
-		/* Zero-pad remainder if file size < IC object size */
-		if (write_size < obj_size) {
-			u16 pad_len = obj_size - write_size;
-
-			if (!(data->crc_enabled))
-				__mxt_write_reg(client, obj_addr + write_size,
-						pad_len, pad_buf, data);
-			else
-				__mxt_write_reg_crc(client,
-						    obj_addr + write_size,
-						    pad_len, pad_buf, data, 0);
-		}
-
-		off += size;
-		written++;
-	}
-
-	dev_info(dev, "[cfg-bin] written=%d skipped=%d\n", written, skipped);
-	return 0;
-}
-
-/*
- * mxt_write_cdm_binary - Write .fw package CDM section via T68
- *
- * Binary CDM format: [datatype(2B LE)][size(2B LE)][data(size B)] ...
- */
-static int mxt_write_cdm_binary(struct mxt_data *data,
-				const u8 *cdm_buf, size_t cdm_len)
-{
-	struct device *dev = &data->client->dev;
-	struct i2c_client *client = data->client;
-	struct mxt_object *t68_obj;
-	size_t off = 0;
-	size_t data_off;
-	int entry = 0, frame;
-	int ret;
-	u16 t68_addr, cmd_addr, datatype, dsize;
-	u8 frame_size, chunk;
-	u8 ctrl, dt_buf[2], len_buf, cmd_buf;
-	u8 zeros[256];
-
-	t68_obj = mxt_get_object(data, MXT_SPT_SERIALDATACOMMAND_T68);
-	if (!t68_obj) {
-		dev_err(dev, "[cdm] T68 not found\n");
-		return -ENODEV;
-	}
-
-	t68_addr = t68_obj->start_address;
-	frame_size = mxt_obj_size(t68_obj) - 9;
-	cmd_addr = t68_addr + mxt_obj_size(t68_obj) - 3;
-
-	memset(zeros, 0, sizeof(zeros));
-
-	while (off + 4 <= cdm_len) {
-		datatype = (u16)cdm_buf[off] | ((u16)cdm_buf[off + 1] << 8);
-		dsize = (u16)cdm_buf[off + 2] | ((u16)cdm_buf[off + 3] << 8);
-		off += 4;
-
-		if (dsize == 0 || off + dsize > cdm_len)
-			break;
-
-		entry++;
-		dev_info(dev, "[cdm] entry %d: datatype=0x%04X size=%u\n",
-			 entry, datatype, dsize);
-
-		/* Enable T68 */
-		ctrl = T68_CTRL_ENABLE | T68_CTRL_RPTEN;
-		if (!(data->crc_enabled))
-			__mxt_write_reg(client, t68_addr, 1, &ctrl, data);
-		else
-			__mxt_write_reg_crc(client, t68_addr, 1, &ctrl,
-					    data, 0);
-
-		/* Write datatype */
-		dt_buf[0] = (u8)(datatype & 0xFF);
-		dt_buf[1] = (u8)((datatype >> 8) & 0xFF);
-		if (!(data->crc_enabled))
-			__mxt_write_reg(client, t68_addr + T68_DTYPE_OFFSET,
-					2, dt_buf, data);
-		else
-			__mxt_write_reg_crc(client, t68_addr + T68_DTYPE_OFFSET,
-					    2, dt_buf, data, 0);
-
-		/* Zero data area */
-		if (!(data->crc_enabled))
-			__mxt_write_reg(client, t68_addr + T68_DATA_OFFSET,
-					frame_size, zeros, data);
-		else
-			__mxt_write_reg_crc(client, t68_addr + T68_DATA_OFFSET,
-					    frame_size, zeros, data, 0);
-
-		/* Send frames */
-		data_off = 0;
-		frame = 0;
-
-		while (data_off < dsize) {
-			chunk = ((dsize - data_off) < frame_size) ?
-				(u8)(dsize - data_off) : frame_size;
-			frame++;
-
-			/* Write data */
-			if (!(data->crc_enabled))
-				__mxt_write_reg(client,
-						t68_addr + T68_DATA_OFFSET,
-						chunk,
-						cdm_buf + off + data_off,
-						data);
-			else
-				__mxt_write_reg_crc(client,
-						    t68_addr + T68_DATA_OFFSET,
-						    chunk,
-						    cdm_buf + off + data_off,
-						    data, 0);
-
-			/* Write length */
-			len_buf = chunk;
-			if (!(data->crc_enabled))
-				__mxt_write_reg(client,
-						t68_addr + T68_LENGTH_OFFSET,
-						1, &len_buf, data);
-			else
-				__mxt_write_reg_crc(client,
-						    t68_addr + T68_LENGTH_OFFSET,
-						    1, &len_buf, data, 0);
-
-			data_off += chunk;
-
-			/* Command */
-			if (frame == 1)
-				cmd_buf = T68_CMD_START;
-			else if (data_off >= dsize)
-				cmd_buf = T68_CMD_END;
-			else
-				cmd_buf = T68_CMD_CONTINUE;
-
-			if (!(data->crc_enabled))
-				__mxt_write_reg(client, cmd_addr, 1,
-						&cmd_buf, data);
-			else
-				__mxt_write_reg_crc(client, cmd_addr, 1,
-						    &cmd_buf, data, 0);
-
-			/* Wait for T68 completion */
-			reinit_completion(&data->t68_completion);
-			ret = mxt_wait_for_completion(data,
-						      &data->t68_completion,
-						      MXT_T68_TIMEOUT);
-			if (ret)
-				dev_warn(dev, "[cdm] T68 timeout frame %d\n",
-					 frame);
-		}
-
-		off += dsize;
-		dev_info(dev, "[cdm] entry %d done (%d frames)\n",
-			 entry, frame);
-	}
-
-	dev_info(dev, "[cdm] all %d entries programmed\n", entry);
-	return 0;
-}
-
-/*
- * mxt_flash_fw_package - Full .fw package update (fw + cfg + cdm) with timing
- *
- * Triggered by: echo 1 > /sys/.../flash_fw_package
- */
-static int mxt_flash_fw_package(struct device *dev, const char *fn)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	const struct firmware *fw = NULL;
-	ktime_t t_start, t_phase;
-	s64 ms_fw = 0, ms_cfg = 0, ms_cdm = 0, ms_total;
-	u32 magic, hdr_len, cfg_len, fw_len, cdm_len = 0;
-	const u8 *cfg_ptr = NULL, *cdm_ptr = NULL;
-	int ret;
-
-	t_start = ktime_get();
-
-	ret = request_firmware(&fw, fn, dev);
-	if (ret) {
-		dev_err(dev, "[fw-pkg] Cannot open %s (%d)\n", fn, ret);
-		return ret;
-	}
-	dev_info(dev, "[fw-pkg] Opened %s (%zu bytes)\n", fn, fw->size);
-
-	if (fw->size < MXT_FW_HDR_BASE) {
-		dev_err(dev, "[fw-pkg] File too small\n");
-		ret = -EINVAL;
-		goto release;
-	}
-
-	magic = mxt_read_le32(fw->data);
-	if (magic != MXT_FW_MAGIC) {
-		/* .enc - fw flash only */
-		dev_info(dev, "[fw-pkg] No magic, treating as .enc\n");
-		release_firmware(fw);
-		fw = NULL;
-		t_phase = ktime_get();
-		ret = mxt_load_fw(dev, fn);
-		ms_fw = ktime_ms_delta(ktime_get(), t_phase);
-		dev_info(dev, "[fw-time] FW flash: %lld ms\n", ms_fw);
-		ms_total = ktime_ms_delta(ktime_get(), t_start);
-		dev_info(dev, "[fw-time] TOTAL: %lld ms\n", ms_total);
-		return ret;
-	}
-
-	/* Parse .fw header */
-	hdr_len = mxt_read_le32(fw->data + 0x04);
-	cfg_len = mxt_read_le32(fw->data + 0x08);
-	fw_len  = mxt_read_le32(fw->data + 0x0C);
-	if (hdr_len >= MXT_FW_HDR_CDM)
-		cdm_len = mxt_read_le32(fw->data + 0x16);
-
-	dev_info(dev, "[fw-pkg] hdr=%u cfg=%u fw=%u cdm=%u\n",
-		 hdr_len, cfg_len, fw_len, cdm_len);
-
-	if ((size_t)(hdr_len + cfg_len + fw_len + cdm_len) > fw->size) {
-		dev_err(dev, "[fw-pkg] Section lengths exceed file\n");
-		ret = -EINVAL;
-		goto release;
-	}
-
-	cfg_ptr = fw->data + hdr_len;
-	cdm_ptr = fw->data + hdr_len + cfg_len + fw_len;
-
-	/* Phase 1: FW flash */
-	if (fw_len > 0) {
-		dev_info(dev, "[fw-pkg] Phase 1/3: FW flash (%u bytes)\n",
-			 fw_len);
-		release_firmware(fw);
-		fw = NULL;
-		t_phase = ktime_get();
-		ret = mxt_load_fw(dev, fn);
-		ms_fw = ktime_ms_delta(ktime_get(), t_phase);
-		dev_info(dev, "[fw-time] FW flash: %lld ms\n", ms_fw);
-		if (ret) {
-			dev_err(dev, "[fw-pkg] FW flash failed (%d)\n", ret);
-			goto done;
-		}
-
-		/* Re-init after flash */
-		msleep(MXT_FW_FLASH_TIME);
-		mxt_update_seq_num_lock(data, true, 0x00);
-		ret = mxt_acquire_irq(data);
-		if (ret)
-			goto done;
-		mxt_soft_reset(data, true);
-		ret = mxt_read_info_block(data);
-		if (ret) {
-			dev_err(dev, "[fw-pkg] Re-init failed\n");
-			goto done;
-		}
-
-		/* Re-open to access cfg/cdm sections */
-		ret = request_firmware(&fw, fn, dev);
-		if (ret)
-			goto done;
-		cfg_ptr = fw->data + hdr_len;
-		cdm_ptr = fw->data + hdr_len + cfg_len + fw_len;
-	}
-
-	/* Phase 2: Config write */
-	if (cfg_len > 0) {
-		dev_info(dev, "[fw-pkg] Phase 2/3: Config (%u bytes)\n",
-			 cfg_len);
-		t_phase = ktime_get();
-		ret = mxt_write_cfg_binary(data, cfg_ptr, cfg_len);
-		ms_cfg = ktime_ms_delta(ktime_get(), t_phase);
-		dev_info(dev, "[fw-time] Config: %lld ms\n", ms_cfg);
-
-		/* Backup NVM */
-		mxt_t6_command(data, MXT_COMMAND_BACKUPNV,
-			       MXT_BACKUP_VALUE, false);
-		msleep(MXT_BACKUP_TIME);
-	}
-
-	/* Phase 3: CDM/T68 */
-	if (cdm_len > 0) {
-		dev_info(dev, "[fw-pkg] Phase 3/3: CDM (%u bytes)\n", cdm_len);
-		t_phase = ktime_get();
-		ret = mxt_write_cdm_binary(data, cdm_ptr, cdm_len);
-		ms_cdm = ktime_ms_delta(ktime_get(), t_phase);
-		dev_info(dev, "[fw-time] CDM/T68: %lld ms\n", ms_cdm);
-	}
-
-done:
-	ms_total = ktime_ms_delta(ktime_get(), t_start);
-	dev_info(dev,
-		 "[fw-time] === TOTAL: %lld ms (fw=%lld cfg=%lld cdm=%lld) ===\n",
-		 ms_total, ms_fw, ms_cfg, ms_cdm);
-
-release:
-	if (fw)
-		release_firmware(fw);
-	return ret;
-}
-
-/* sysfs: flash_fw_package */
-static ssize_t flash_fw_package_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int error;
-
-	data->sysfs_updating_cfg_fw = true;
-	data->irq_processing = true;
-
-	error = mxt_flash_fw_package(dev, MXT_FW_NAME);
-
-	data->sysfs_updating_cfg_fw = false;
-	data->irq_processing = false;
-
-	if (error) {
-		dev_err(dev, "[fw-pkg] Failed (%d)\n", error);
-		return error;
-	}
-
-	return count;
-}
-static DEVICE_ATTR_WO(flash_fw_package);
 
 static int mxt_update_file_name(struct device *dev, char **file_name,
 				const char *buf, size_t count)
@@ -7862,6 +7422,7 @@ static ssize_t mxt_mem_access_write(struct file *filp, struct kobject *kobj,
 
 static DEVICE_ATTR_RO(fw_version);
 static DEVICE_ATTR_RO(hw_version);
+static DEVICE_ATTR_RO(drvr_version);
 static DEVICE_ATTR_RO(objects);
 static DEVICE_ATTR_RO(crc_enabled);
 static DEVICE_ATTR_RO(debug_notify);
@@ -7884,6 +7445,7 @@ static DEVICE_ATTR(mxt_reset, 0600, reset_show, reset_store);
 static struct attribute *mxt_attrs[] = {
 	&dev_attr_fw_version.attr,
 	&dev_attr_hw_version.attr,
+	&dev_attr_drvr_version.attr,
 	&dev_attr_tx_seq_num.attr,
 	&dev_attr_debug_irq.attr,
 	&dev_attr_crc_enabled.attr,
@@ -7891,7 +7453,6 @@ static struct attribute *mxt_attrs[] = {
 	&dev_attr_update_cfg.attr,
 	&dev_attr_config_crc.attr,
 	&dev_attr_update_fw.attr,
-	&dev_attr_flash_fw_package.attr,
 	&dev_attr_debug_enable.attr,
 	&dev_attr_debug_v2_enable.attr,
 	&dev_attr_debug_notify.attr,
@@ -8254,6 +7815,7 @@ static int mxt_remove(struct i2c_client *client)
 	sysfs_remove_group(&client->dev.kobj, &mxt_attr_group);
 	mxt_free_input_device(data);
 	mxt_free_object_table(data);
+
 	return 0;
 }
 
