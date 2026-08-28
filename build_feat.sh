@@ -26,4 +26,4 @@ cd ${BUILD_DIR}
 /usr/bin/mkimage -f sama5d3.its sama5d3_xplained.itb
 
 echo "=== ITB ready: ${BUILD_DIR}/sama5d3_xplained.itb ==="
-echo "=== Kernel version: 4.19.0-v4.19_${BUILD_NUM} ==="
+echo "=== Kernel version: v4.19-mxtd5.10_${BUILD_NUM} ==="
